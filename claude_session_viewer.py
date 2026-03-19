@@ -1576,10 +1576,14 @@ function unfoldAll() {{
   document.querySelectorAll('#entries > .entry').forEach(e => e.classList.remove('folded'));
 }}
 
+let isGlobalSearchActive = false;
+
 function filterFolders(val) {{
+  // Don't filter folders during global search mode
+  if (isGlobalSearchActive) return;
   val = val.toLowerCase();
   document.querySelectorAll('.folder').forEach(f => {{
-    const match = f.dataset.readable.toLowerCase().includes(val) || f.dataset.name.toLowerCase().includes(val);
+    const match = !val || f.dataset.readable.toLowerCase().includes(val) || f.dataset.name.toLowerCase().includes(val);
     f.style.display = match ? '' : 'none';
   }});
 }}
@@ -2060,11 +2064,24 @@ function handleSearchKey(e) {{
     e.preventDefault();
     const query = val.startsWith('/') ? val.slice(1).trim() : val;
     if (query.length > 0) {{
+      isGlobalSearchActive = true;
+      // Restore all folders while showing search results
+      document.querySelectorAll('.folder').forEach(f => f.style.display = '');
       doGlobalSearch(query);
     }}
     return;
   }}
-  // Normal folder filtering on other keys
+  if (e.key === 'Escape') {{
+    input.value = '';
+    isGlobalSearchActive = false;
+    document.querySelectorAll('.folder').forEach(f => f.style.display = '');
+    input.blur();
+    return;
+  }}
+  // If user starts typing after a global search, switch back to folder filter mode
+  if (isGlobalSearchActive) {{
+    isGlobalSearchActive = false;
+  }}
 }}
 
 async function doGlobalSearch(query) {{
@@ -2094,7 +2111,7 @@ async function doGlobalSearch(query) {{
           new RegExp('(' + escRegex(escHtml(r.match_text)) + ')', 'gi'),
           '<mark>$1</mark>'
         );
-        html += '<div class="search-result" onclick="loadSearchResult(\'' + escAttr(r.path) + '\')">';
+        html += '<div class="search-result" onclick="loadSearchResult(\\x27' + escAttr(r.path) + '\\x27)">';
         html += '<div class="sr-header">';
         html += '<span class="sr-type ' + typeClass + '">' + escHtml(r.record_type) + '</span>';
         html += '<span class="sr-folder">' + escHtml(r.folder.replace(/-/g, '/')) + '</span>';
