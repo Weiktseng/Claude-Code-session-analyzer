@@ -157,6 +157,21 @@ The API View shows each turn within this loop as a separate **REQUEST → RESPON
 | Multi-tool support | Claude Code only | Claude Code only | Claude/Codex/OpenCode | Claude Code | 4 tools |
 | Start new sessions | No | No | No | Yes | No |
 
+## Related Projects
+
+Feature inspiration came from studying these tools in the Claude Code session viewer ecosystem:
+
+- [claude-code-log](https://github.com/daaain/claude-code-log) — CLI-to-HTML converter with TUI browser and Markdown export
+- [Claude JSONL Browser](https://github.com/withLinda/claude-JSONL-browser) — Web-based drag & drop viewer with online demo
+- [Claude Code History Viewer (CCHV)](https://github.com/jhlee0409/claude-code-history-viewer) — Electron/Tauri desktop app with analytics dashboard and multi-tool support
+- [claude-code-viewer](https://github.com/d-kimuson/claude-code-viewer) — Full web client with live sessions, Git diff viewer, and scheduler
+- [ccusage](https://github.com/ryoppippi/ccusage) — CLI usage analytics
+- [Simon Willison's timeline tool](https://tools.simonwillison.net/claude-code-timeline) — Interactive timeline visualization
+
+See also: [Comparison of 4 session history tools](https://dev.to/gonewx/i-tested-4-tools-for-browsing-claude-code-session-history-17ie) by gonewx.
+
+All code in this repo was written from scratch. No source code was copied from the above projects.
+
 ## License
 
 MIT
