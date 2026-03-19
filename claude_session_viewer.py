@@ -6,11 +6,14 @@ import json
 import html
 import os
 import re
+import tempfile
 import urllib.parse
 import webbrowser
 import threading
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+
+import mimetypes
 
 PORT = int(os.environ.get("CSV_PORT", 18923))
 BASE_DIR = os.environ.get(
@@ -457,6 +460,330 @@ def render_api_view(filepath):
     return summary + "\n".join(parts), len(api_groups)
 
 
+def compute_stats(filepath):
+    """Compute session statistics for the stats view."""
+    with open(filepath) as f:
+        records = [json.loads(line) for line in f]
+
+    total_in = 0
+    total_out = 0
+    total_cache_read = 0
+    total_cache_create = 0
+    per_call_cost = []
+    tool_usage = {}
+    first_ts = None
+    last_ts = None
+    api_call_count = 0
+    user_msg_count = 0
+    assistant_msg_count = 0
+    tool_msg_count = 0
+
+    for r in records:
+        rtype = r.get("type", "")
+        ts = r.get("timestamp", "")
+        if ts:
+            try:
+                dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                if first_ts is None:
+                    first_ts = dt
+                last_ts = dt
+            except Exception:
+                pass
+
+        if rtype == "user":
+            user_msg_count += 1
+            msg = r.get("message", {})
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "tool_result":
+                        tool_msg_count += 1
+
+        elif rtype == "assistant":
+            assistant_msg_count += 1
+            msg = r.get("message", {})
+            usage = msg.get("usage", {})
+            if usage:
+                api_call_count += 1
+                in_tok = usage.get("input_tokens", 0)
+                out_tok = usage.get("output_tokens", 0)
+                cache_read = usage.get("cache_read_input_tokens", 0)
+                cache_create = usage.get("cache_creation_input_tokens", 0)
+                total_in += in_tok
+                total_out += out_tok
+                total_cache_read += cache_read
+                total_cache_create += cache_create
+                call_cost = (in_tok * 15 + out_tok * 75 + cache_read * 1.5 + cache_create * 18.75) / 1_000_000
+                per_call_cost.append(round(call_cost, 6))
+
+            for block in msg.get("content", []):
+                if isinstance(block, dict) and block.get("type") == "tool_use":
+                    name = block.get("name", "unknown")
+                    tool_usage[name] = tool_usage.get(name, 0) + 1
+
+    duration_sec = 0
+    if first_ts and last_ts:
+        duration_sec = int((last_ts - first_ts).total_seconds())
+
+    total_cost = (total_in * 15 + total_out * 75 + total_cache_read * 1.5 + total_cache_create * 18.75) / 1_000_000
+
+    return {
+        "total_input": total_in,
+        "total_output": total_out,
+        "total_cache_read": total_cache_read,
+        "total_cache_create": total_cache_create,
+        "total_cost": round(total_cost, 4),
+        "per_call_cost": per_call_cost,
+        "tool_usage": tool_usage,
+        "duration_sec": duration_sec,
+        "api_call_count": api_call_count,
+        "user_msg_count": user_msg_count,
+        "assistant_msg_count": assistant_msg_count,
+        "tool_msg_count": tool_msg_count,
+    }
+
+
+SECRET_PATTERNS = [
+    ("Anthropic API Key", r'sk-ant-[a-zA-Z0-9\-]{20,}'),
+    ("OpenAI API Key", r'sk-[a-zA-Z0-9]{20,}'),
+    ("GitHub PAT", r'ghp_[a-zA-Z0-9]{36}'),
+    ("AWS Access Key", r'AKIA[0-9A-Z]{16}'),
+    ("Private Key", r'-----BEGIN[A-Z ]*PRIVATE KEY-----'),
+    ("Generic Secret", r'(?:api_key|token|secret|password|API_KEY|TOKEN|SECRET|PASSWORD)\s*[=:]\s*["\']?([A-Za-z0-9_\-/.+]{8,})["\']?'),
+]
+
+
+def search_sessions(query, folder=None):
+    """Search across session JSONL files for matching text content."""
+    query_lower = query.lower()
+    results = []
+    total = 0
+
+    if folder:
+        folders_to_search = [folder]
+    else:
+        try:
+            folders_to_search = [
+                name for name in sorted(os.listdir(BASE_DIR))
+                if os.path.isdir(os.path.join(BASE_DIR, name))
+            ]
+        except Exception:
+            return []
+
+    for fname in folders_to_search:
+        folder_path = os.path.join(BASE_DIR, fname)
+        if not os.path.isdir(folder_path):
+            continue
+        try:
+            jsonl_files = [f for f in os.listdir(folder_path) if f.endswith(".jsonl")]
+        except Exception:
+            continue
+        for jf in jsonl_files:
+            if total >= 50:
+                break
+            fpath = os.path.join(folder_path, jf)
+            file_matches = 0
+            try:
+                with open(fpath) as f:
+                    for line in f:
+                        if file_matches >= 10 or total >= 50:
+                            break
+                        try:
+                            r = json.loads(line)
+                        except Exception:
+                            continue
+                        rtype = r.get("type", "")
+                        ts = r.get("timestamp", "")
+                        text = ""
+                        if rtype == "user":
+                            msg = r.get("message", {})
+                            c = msg.get("content", "")
+                            if isinstance(c, str):
+                                text = c
+                            elif isinstance(c, list):
+                                text = " ".join(
+                                    b.get("text", "") for b in c
+                                    if isinstance(b, dict) and b.get("type") == "text"
+                                )
+                        elif rtype == "assistant":
+                            msg = r.get("message", {})
+                            blocks = msg.get("content", [])
+                            parts = []
+                            for b in blocks:
+                                if isinstance(b, dict) and b.get("type") == "text":
+                                    parts.append(b.get("text", ""))
+                            text = " ".join(parts)
+                        else:
+                            continue
+
+                        if not text:
+                            continue
+                        if query_lower in text.lower():
+                            # Find the match position for preview context
+                            idx = text.lower().find(query_lower)
+                            start = max(0, idx - 40)
+                            end = min(len(text), idx + len(query) + 40)
+                            preview = text[start:end].replace("\n", " ")
+                            if start > 0:
+                                preview = "..." + preview
+                            if end < len(text):
+                                preview = preview + "..."
+                            match_text = text[idx:idx + len(query)]
+                            results.append({
+                                "folder": fname,
+                                "filename": jf,
+                                "session_id": jf.replace(".jsonl", ""),
+                                "preview": preview,
+                                "match_text": match_text,
+                                "record_type": rtype,
+                                "timestamp": fmt_date(ts),
+                                "path": fpath,
+                            })
+                            file_matches += 1
+                            total += 1
+            except Exception:
+                continue
+        if total >= 50:
+            break
+
+    return results
+
+
+def poll_changes(since):
+    """Find files modified after the given epoch timestamp."""
+    changed = []
+    try:
+        for name in os.listdir(BASE_DIR):
+            folder_path = os.path.join(BASE_DIR, name)
+            if not os.path.isdir(folder_path):
+                continue
+            try:
+                for jf in os.listdir(folder_path):
+                    if not jf.endswith(".jsonl"):
+                        continue
+                    fpath = os.path.join(folder_path, jf)
+                    try:
+                        mtime = os.path.getmtime(fpath)
+                        if mtime > since:
+                            changed.append({
+                                "folder": name,
+                                "filename": jf,
+                                "mtime": mtime,
+                                "path": fpath,
+                            })
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return changed
+
+
+def scan_secrets(filepath):
+    """Scan a session file for potential secrets/credentials."""
+    matches = []
+    seen = set()
+    with open(filepath) as f:
+        for line_num, line in enumerate(f, 1):
+            for label, pattern in SECRET_PATTERNS:
+                for m in re.finditer(pattern, line):
+                    raw = m.group(0)
+                    if raw in seen:
+                        continue
+                    seen.add(raw)
+                    if len(raw) > 10:
+                        masked = raw[:6] + "..." + raw[-4:]
+                    else:
+                        masked = raw[:3] + "..." + raw[-2:]
+                    matches.append({
+                        "type": label,
+                        "masked": masked,
+                        "line": line_num,
+                    })
+    return matches
+
+
+def export_markdown(filepath):
+    """Export a session as readable Markdown."""
+    with open(filepath) as f:
+        records = [json.loads(line) for line in f]
+
+    lines = []
+    sid = Path(filepath).stem
+    lines.append(f"# Session: {sid}\n")
+
+    for r in records:
+        rtype = r.get("type", "")
+        ts = fmt_time(r.get("timestamp", ""))
+
+        if rtype == "user":
+            msg = r.get("message", {})
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") == "text":
+                        text = block.get("text", "")
+                        if text.strip():
+                            lines.append(f"\n## User ({ts})\n\n{text}\n")
+                    elif block.get("type") == "tool_result":
+                        tid = block.get("tool_use_id", "")[:12]
+                        rc = block.get("content", "")
+                        if isinstance(rc, list):
+                            rc = "\n".join(b.get("text", "") for b in rc if isinstance(b, dict))
+                        lines.append(f"\n### Tool Result (id:{tid}...)\n\n```\n{str(rc)[:2000]}\n```\n")
+            else:
+                text = str(content)
+                if text.strip():
+                    lines.append(f"\n## User ({ts})\n\n{text}\n")
+
+        elif rtype == "assistant":
+            msg = r.get("message", {})
+            for block in msg.get("content", []):
+                btype = block.get("type", "")
+                if btype == "text":
+                    text = block.get("text", "")
+                    if text.strip():
+                        lines.append(f"\n## Assistant ({ts})\n\n{text}\n")
+                elif btype == "thinking":
+                    text = block.get("thinking", "")
+                    if text.strip():
+                        lines.append(f"\n### Thinking\n\n<details><summary>Thinking...</summary>\n\n{text}\n\n</details>\n")
+                elif btype == "tool_use":
+                    name = block.get("name", "?")
+                    inp = block.get("input", {})
+                    inp_json = json.dumps(inp, ensure_ascii=False, indent=2)
+                    lines.append(f"\n### Tool: {name}\n\n```json\n{inp_json[:3000]}\n```\n")
+
+    return "\n".join(lines)
+
+
+def export_html(filepath):
+    """Export a session as standalone HTML."""
+    content, count, compact_total = render_session(filepath)
+    sid = Path(filepath).stem
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Session: {esc(sid)}</title>
+<style>
+{CSS}
+body {{ background: #0d1117; color: #c9d1d9; font-family: -apple-system, "Segoe UI", sans-serif; padding: 20px; max-width: 900px; margin: 0 auto; }}
+.sidebar, .nav-toolbar, .scroll-progress, .minimap, .position-indicator, .filters {{ display: none; }}
+.main {{ margin-left: 0; }}
+</style>
+</head>
+<body>
+<h1 style="color:#58a6ff">Session: {esc(sid)}</h1>
+<p style="color:#8b949e;margin-bottom:16px">{count} entries | Exported {datetime.now().strftime('%Y-%m-%d %H:%M')}</p>
+{content}
+</body>
+</html>"""
+
+
 # ─── CSS ───
 CSS = """
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -592,6 +919,7 @@ code.ic { background: #30363d; padding: 1px 3px; border-radius: 3px; font-size: 
 .view-toggle { display: flex; gap: 0; margin-bottom: 14px; }
 .view-toggle button { background: #21262d; color: #8b949e; border: 1px solid #30363d; padding: 5px 14px; font-size: 0.82em; cursor: pointer; transition: all 0.15s; }
 .view-toggle button:first-child { border-radius: 6px 0 0 6px; }
+.view-toggle button:not(:first-child):not(:last-child) { border-radius: 0; }
 .view-toggle button:last-child { border-radius: 0 6px 6px 0; }
 .view-toggle button.active { background: #1f6feb22; color: #58a6ff; border-color: #1f6feb; }
 
@@ -656,7 +984,183 @@ code.ic { background: #30363d; padding: 1px 3px; border-radius: 3px; font-size: 
 ::-webkit-scrollbar { width: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: #30363d; border-radius: 3px; }
+
+/* Stats View */
+.stats-cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 20px; }
+.stat-card { background: #161b22; border: 1px solid #21262d; border-radius: 10px; padding: 16px; text-align: center; }
+.stat-card .stat-value { font-size: 1.6em; font-weight: 700; color: #58a6ff; }
+.stat-card .stat-label { font-size: 0.78em; color: #8b949e; margin-top: 4px; }
+.stat-card.cost .stat-value { color: #3fb950; }
+.stat-card.duration .stat-value { color: #d29922; }
+.stat-card.tokens .stat-value { color: #a371f7; }
+.stats-charts { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 20px; }
+.stats-chart-box { background: #161b22; border: 1px solid #21262d; border-radius: 10px; padding: 16px; }
+.stats-chart-box h3 { font-size: 0.9em; color: #8b949e; margin-bottom: 12px; }
+.stats-chart-box.full-width { grid-column: 1 / -1; }
+.stats-chart-box svg { width: 100%; }
+
+/* Secret Warning */
+.secret-banner { background: #da363322; border: 1px solid #f8514966; border-radius: 8px; padding: 10px 14px; margin-bottom: 14px; color: #ff7b72; font-size: 0.88em; display: none; }
+.secret-banner.visible { display: block; }
+.secret-banner strong { color: #f85149; }
+.secret-badge { display: inline-block; background: #da3633; color: #fff; font-size: 0.65em; padding: 1px 5px; border-radius: 8px; margin-left: 4px; font-weight: 700; vertical-align: middle; }
+.secret-list { margin-top: 8px; font-family: monospace; font-size: 0.85em; }
+.secret-list div { padding: 2px 0; }
+.secret-type { color: #f85149; font-weight: 600; margin-right: 6px; }
+.secret-masked { color: #d29922; }
+.entry[data-has-secret="1"] { box-shadow: inset 0 0 0 1px #f8514944; }
+
+/* Timeline View */
+.timeline-container { position: relative; overflow-x: auto; overflow-y: hidden; background: #0d1117; border: 1px solid #21262d; border-radius: 10px; padding: 20px 10px 10px; min-height: 300px; cursor: grab; user-select: none; }
+.timeline-container.dragging { cursor: grabbing; }
+.timeline-inner { position: relative; min-height: 260px; }
+.timeline-axis { position: absolute; bottom: 0; left: 0; right: 0; height: 28px; border-top: 1px solid #30363d; }
+.timeline-tick { position: absolute; bottom: 0; color: #484f58; font-size: 0.7em; font-family: monospace; text-align: center; transform: translateX(-50%); }
+.timeline-tick::before { content: ''; position: absolute; top: -6px; left: 50%; width: 1px; height: 6px; background: #30363d; }
+.timeline-card { position: absolute; width: 80px; padding: 4px 6px; border-radius: 5px; font-size: 0.68em; line-height: 1.3; cursor: pointer; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; border: 1px solid transparent; transition: all 0.12s; z-index: 1; }
+.timeline-card:hover { z-index: 10; filter: brightness(1.3); border-color: #58a6ff88; overflow: visible; white-space: normal; width: auto; min-width: 80px; max-width: 200px; }
+.timeline-card.tc-user { background: #23863644; color: #3fb950; border-color: #23863633; }
+.timeline-card.tc-assistant { background: #1f6feb33; color: #79c0ff; border-color: #1f6feb33; }
+.timeline-card.tc-tool { background: #9e6a0333; color: #e3b341; border-color: #9e6a0333; }
+.timeline-card.tc-thinking { background: #30363d88; color: #8b949e; border-color: #30363d; }
+.timeline-card.tc-system { background: #da363322; color: #ff7b72; border-color: #da363333; }
+.timeline-card.tc-progress { background: #21262d; color: #6e7681; border-color: #21262d; }
+.timeline-cursor { position: absolute; top: 0; bottom: 28px; width: 1px; background: #58a6ff55; pointer-events: none; z-index: 20; }
+.timeline-cursor-label { position: absolute; top: -18px; left: 50%; transform: translateX(-50%); font-size: 0.65em; color: #58a6ff; font-family: monospace; white-space: nowrap; background: #0d1117cc; padding: 1px 4px; border-radius: 3px; }
+.timeline-controls { display: flex; gap: 6px; margin-bottom: 8px; align-items: center; }
+.timeline-controls button { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; padding: 3px 10px; border-radius: 6px; cursor: pointer; font-size: 0.82em; }
+.timeline-controls button:hover { border-color: #484f58; }
+.timeline-controls .tl-legend { display: flex; gap: 10px; margin-left: 16px; font-size: 0.72em; color: #8b949e; }
+.timeline-controls .tl-legend span::before { content: ''; display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 3px; vertical-align: middle; }
+.timeline-controls .tl-legend .lg-user::before { background: #3fb950; }
+.timeline-controls .tl-legend .lg-assistant::before { background: #58a6ff; }
+.timeline-controls .tl-legend .lg-tool::before { background: #d29922; }
+.timeline-controls .tl-legend .lg-thinking::before { background: #6e7681; }
+.timeline-controls .tl-legend .lg-system::before { background: #f85149; }
+
+/* Drop zone */
+.drop-zone { border: 2px dashed #30363d; border-radius: 12px; padding: 40px 20px; text-align: center; color: #484f58; margin-top: 30px; transition: all 0.2s; cursor: default; }
+.drop-zone.drag-over { border-color: #58a6ff; background: #1f6feb11; color: #58a6ff; }
+.drop-zone p { font-size: 0.95em; margin-bottom: 6px; }
+.drop-zone .drop-icon { font-size: 2em; margin-bottom: 8px; opacity: 0.5; }
+.drop-overlay { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: #0d111799; z-index: 1000; align-items: center; justify-content: center; }
+.drop-overlay.visible { display: flex; }
+.drop-overlay-inner { border: 3px dashed #58a6ff; border-radius: 16px; padding: 60px 80px; text-align: center; color: #58a6ff; font-size: 1.2em; background: #161b22ee; }
+
+/* Global Search Results */
+.search-results { padding: 0; }
+.search-results h2 { color: #58a6ff; font-size: 1.2em; margin-bottom: 12px; }
+.search-results .sr-meta { color: #484f58; font-size: 0.82em; margin-bottom: 16px; }
+.search-result { background: #161b22; border: 1px solid #21262d; border-radius: 8px; padding: 10px 14px; margin-bottom: 8px; cursor: pointer; transition: all 0.15s; }
+.search-result:hover { border-color: #388bfd; background: #1f6feb08; }
+.search-result .sr-header { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; font-size: 0.78em; flex-wrap: wrap; }
+.search-result .sr-folder { color: #8b949e; }
+.search-result .sr-type { display: inline-block; font-size: 0.75em; padding: 1px 5px; border-radius: 3px; font-weight: 600; }
+.search-result .sr-type-user { background: #238636; color: #fff; }
+.search-result .sr-type-assistant { background: #1f6feb; color: #fff; }
+.search-result .sr-time { color: #484f58; }
+.search-result .sr-preview { color: #c9d1d9; font-size: 0.88em; line-height: 1.5; }
+.search-result .sr-preview mark { background: #d2992244; color: #e3b341; padding: 0 2px; border-radius: 2px; }
+.search-result .sr-session { color: #484f58; font-size: 0.72em; margin-top: 4px; font-family: monospace; }
+
+/* Live Watch */
+.watch-toggle { background: none; border: 1px solid #30363d; color: #484f58; border-radius: 4px; cursor: pointer; font-size: 0.75em; padding: 2px 8px; margin-left: 8px; transition: all 0.15s; display: inline-flex; align-items: center; gap: 4px; }
+.watch-toggle:hover { border-color: #484f58; color: #8b949e; }
+.watch-toggle.active { border-color: #3fb950; color: #3fb950; }
+.watch-dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: #484f58; }
+.watch-toggle.active .watch-dot { background: #3fb950; animation: watchPulse 1.5s infinite; }
+@keyframes watchPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+.session-badge { display: inline-block; font-size: 0.6em; padding: 0 4px; border-radius: 3px; font-weight: 700; margin-left: 4px; vertical-align: middle; }
+.session-badge-new { background: #23863644; color: #3fb950; border: 1px solid #23863666; }
+.session-badge-upd { background: #d2992244; color: #e3b341; border: 1px solid #d2992266; }
+.reload-banner { background: #1f6feb22; border: 1px solid #388bfd66; border-radius: 8px; padding: 8px 14px; margin-bottom: 12px; color: #79c0ff; font-size: 0.85em; cursor: pointer; display: none; transition: all 0.15s; }
+.reload-banner:hover { background: #1f6feb33; }
+
+/* Export dropdown */
+.export-dropdown { position: relative; display: inline-block; }
+.export-dropdown-btn { background: #21262d; color: #8b949e; border: 1px solid #30363d; padding: 5px 14px; font-size: 0.82em; cursor: pointer; border-radius: 6px; }
+.export-dropdown-btn:hover { border-color: #484f58; color: #c9d1d9; }
+.export-menu { display: none; position: absolute; top: 100%; left: 0; background: #161b22; border: 1px solid #30363d; border-radius: 6px; z-index: 30; min-width: 140px; margin-top: 4px; overflow: hidden; }
+.export-menu.open { display: block; }
+.export-menu a { display: block; padding: 8px 14px; color: #c9d1d9; font-size: 0.82em; text-decoration: none; }
+.export-menu a:hover { background: #21262d; }
 """
+
+def compute_timeline(filepath):
+    """Parse JSONL and return timeline entries with timestamp, type, summary, and id."""
+    entries = []
+    idx = 0
+    with open(filepath) as f:
+        for line in f:
+            try:
+                r = json.loads(line)
+            except Exception:
+                idx += 1
+                continue
+            ts = r.get("timestamp", "")
+            rtype = r.get("type", "")
+            summary = ""
+
+            if rtype == "user":
+                msg = r.get("message", {})
+                c = msg.get("content", "")
+                if isinstance(c, list):
+                    parts = []
+                    for block in c:
+                        if isinstance(block, dict):
+                            if block.get("type") == "text":
+                                parts.append(block.get("text", ""))
+                            elif block.get("type") == "tool_result":
+                                parts.append("[tool_result]")
+                    summary = " ".join(parts)[:60]
+                else:
+                    summary = str(c)[:60]
+                etype = "user"
+            elif rtype == "assistant":
+                msg = r.get("message", {})
+                blocks = msg.get("content", [])
+                etype = "assistant"
+                for block in blocks:
+                    if not isinstance(block, dict):
+                        continue
+                    bt = block.get("type", "")
+                    if bt == "text":
+                        summary = block.get("text", "")[:60]
+                        break
+                    elif bt == "thinking":
+                        summary = "thinking"
+                        etype = "thinking"
+                        break
+                    elif bt == "tool_use":
+                        summary = block.get("name", "tool")
+                        etype = "tool"
+                        break
+            elif rtype == "system":
+                etype = "system"
+                summary = r.get("subtype", "system")[:60]
+            elif rtype == "progress":
+                etype = "progress"
+                data = r.get("data", {})
+                summary = data.get("type", "progress")[:60]
+            else:
+                idx += 1
+                continue
+
+            if ts:
+                entries.append({
+                    "ts": ts,
+                    "type": etype,
+                    "summary": summary.replace("\n", " "),
+                    "id": idx,
+                })
+            idx += 1
+
+    entries.sort(key=lambda e: e["ts"])
+    return entries
+
+
+UPLOAD_DIR = os.path.join(tempfile.gettempdir(), "csv_uploads")
+
 
 # ─── Handler ───
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -681,6 +1185,104 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif path == "/api/apiview":
             file = params.get("file", [""])[0]
             self.send_html_fragment(self.api_apiview(file))
+        elif path == "/api/stats":
+            file = params.get("file", [""])[0]
+            if not file or not os.path.isfile(file):
+                self.send_json({"error": "file not found"})
+            else:
+                try:
+                    self.send_json(compute_stats(file))
+                except Exception as e:
+                    self.send_json({"error": str(e)})
+        elif path == "/api/secrets":
+            file = params.get("file", [""])[0]
+            if not file or not os.path.isfile(file):
+                self.send_json({"error": "file not found"})
+            else:
+                try:
+                    self.send_json(scan_secrets(file))
+                except Exception as e:
+                    self.send_json({"error": str(e)})
+        elif path == "/api/search":
+            q = params.get("q", [""])[0]
+            folder = params.get("folder", [""])[0] or None
+            if not q:
+                self.send_json([])
+            else:
+                try:
+                    self.send_json(search_sessions(q, folder))
+                except Exception as e:
+                    self.send_json({"error": str(e)})
+        elif path == "/api/poll":
+            since = float(params.get("since", ["0"])[0])
+            try:
+                self.send_json(poll_changes(since))
+            except Exception as e:
+                self.send_json({"error": str(e)})
+        elif path == "/api/timeline":
+            file = params.get("file", [""])[0]
+            if not file or not os.path.isfile(file):
+                self.send_json({"error": "file not found"})
+            else:
+                try:
+                    self.send_json(compute_timeline(file))
+                except Exception as e:
+                    self.send_json({"error": str(e)})
+        elif path == "/api/export":
+            file = params.get("file", [""])[0]
+            fmt = params.get("fmt", ["md"])[0]
+            if not file or not os.path.isfile(file):
+                self.send_error(404)
+            else:
+                try:
+                    sid = Path(file).stem[:20]
+                    if fmt == "html":
+                        content = export_html(file)
+                        self.send_response(200)
+                        self.send_header("Content-Type", "text/html; charset=utf-8")
+                        self.send_header("Content-Disposition", f'attachment; filename="session_{sid}.html"')
+                        self.end_headers()
+                        self.wfile.write(content.encode())
+                    else:
+                        content = export_markdown(file)
+                        self.send_response(200)
+                        self.send_header("Content-Type", "text/markdown; charset=utf-8")
+                        self.send_header("Content-Disposition", f'attachment; filename="session_{sid}.md"')
+                        self.end_headers()
+                        self.wfile.write(content.encode())
+                except Exception as e:
+                    self.send_error(500, str(e))
+        else:
+            self.send_error(404)
+
+    def do_POST(self):
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+
+        if path == "/api/upload":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(length).decode("utf-8")
+                # Validate each line is valid JSON
+                lines = body.strip().split("\n")
+                for i, line in enumerate(lines):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        json.loads(line)
+                    except json.JSONDecodeError:
+                        self.send_json({"ok": False, "error": f"Invalid JSON at line {i + 1}"})
+                        return
+                # Save to temp dir
+                os.makedirs(UPLOAD_DIR, exist_ok=True)
+                fname = f"upload_{int(datetime.now().timestamp())}_{os.getpid()}.jsonl"
+                fpath = os.path.join(UPLOAD_DIR, fname)
+                with open(fpath, "w") as f:
+                    f.write(body)
+                self.send_json({"ok": True, "path": fpath})
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)})
         else:
             self.send_error(404)
 
@@ -772,10 +1374,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
 <body>
 
 <div class="sidebar">
-  <h2><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#58a6ff" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg> Sessions</h2>
-  <input type="text" id="folder-search" placeholder="搜尋專案資料夾..." oninput="filterFolders(this.value)">
+  <h2><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#58a6ff" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg> Sessions <button class="watch-toggle" id="watch-toggle" onclick="toggleWatch()" title="Live Watch — auto-detect new/modified sessions"><span class="watch-dot"></span>Watch</button></h2>
+  <input type="text" id="folder-search" placeholder="搜尋資料夾… / Enter=全域搜尋 / 以 / 開頭=全域搜尋" onkeydown="handleSearchKey(event)" oninput="filterFolders(this.value)">
   <div id="folder-list"></div>
 </div>
+
+<!-- Drop overlay for file upload -->
+<div class="drop-overlay" id="drop-overlay"><div class="drop-overlay-inner">Drop .jsonl file here</div></div>
 
 <!-- Scroll progress -->
 <div class="scroll-progress"><div class="scroll-progress-bar" id="scroll-bar"></div></div>
@@ -797,6 +1402,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 </div>
 
 <div class="main">
+  <div class="reload-banner" id="reload-banner" onclick="reloadCurrentSession()">Session updated — click to reload</div>
   <div id="viewer">
     <div class="welcome">
       <div class="logo">
@@ -804,8 +1410,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
       </div>
       <h2>Claude Code Session Viewer</h2>
       <p>從左側選擇專案和 session 開始瀏覽</p>
+      <div class="drop-zone" id="welcome-drop-zone">
+        <div class="drop-icon">&#x1F4C4;</div>
+        <p>Drag &amp; drop a .jsonl file to view</p>
+        <p style="font-size:0.78em;color:#30363d">Or select a session from the sidebar</p>
+      </div>
       <div style="margin-top:20px;color:#30363d;font-size:0.8em">
-        快捷鍵：<span class="kbd">T</span> 頂端 <span class="kbd">B</span> 底部 <span class="kbd">J</span>/<span class="kbd">K</span> 下/上一個 User <span class="kbd">N</span>/<span class="kbd">P</span> 下/上一個 Compact
+        快捷鍵：<span class="kbd">T</span> 頂端 <span class="kbd">B</span> 底部 <span class="kbd">J</span>/<span class="kbd">K</span> 下/上一個 User <span class="kbd">N</span>/<span class="kbd">P</span> 下/上一個 Compact <span class="kbd">/</span> 全域搜尋
       </div>
     </div>
   </div>
@@ -877,10 +1488,23 @@ async function loadSession(filepath, el) {{
   const html = await res.text();
 
   viewer.innerHTML = `
-    <div class="view-toggle">
-      <button class="active" onclick="switchView('chat', this)">Chat View</button>
-      <button onclick="switchView('api', this)">API View</button>
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;flex-wrap:wrap">
+      <div class="view-toggle">
+        <button class="active" onclick="switchView('chat', this)">Chat View</button>
+        <button onclick="switchView('api', this)">API View</button>
+        <button onclick="switchView('stats', this)">Stats</button>
+        <button onclick="switchView('timeline', this)">Timeline</button>
+      </div>
+      <div class="export-dropdown">
+        <button class="export-dropdown-btn" onclick="toggleExportMenu()">Export &#x25BE;</button>
+        <div class="export-menu" id="export-menu">
+          <a href="#" onclick="doExport('md');return false">Markdown (.md)</a>
+          <a href="#" onclick="doExport('html');return false">HTML (.html)</a>
+        </div>
+      </div>
+      <span id="secret-badge-area"></span>
     </div>
+    <div class="secret-banner" id="secret-banner"></div>
     <div id="chat-view">
       <div class="filters">
         <button class="active" data-f="user" onclick="tf(this)">User</button>
@@ -897,8 +1521,11 @@ async function loadSession(filepath, el) {{
       <div id="entries">${{html}}</div>
     </div>
     <div id="api-view" style="display:none"></div>
+    <div id="stats-view" style="display:none"></div>
+    <div id="timeline-view" style="display:none"></div>
   `;
   applyFilters();
+  checkSecrets();
 }}
 
 const activeFilters = new Set(['user', 'assistant', 'tool']);
@@ -1022,6 +1649,8 @@ function jumpToCall(el) {{
 
 // ─── View Toggle ───
 let apiViewLoaded = false;
+let apiStatsLoaded = false;
+let apiTimelineLoaded = false;
 
 async function switchView(view, btn) {{
   document.querySelectorAll('.view-toggle button').forEach(b => b.classList.remove('active'));
@@ -1029,12 +1658,17 @@ async function switchView(view, btn) {{
 
   const chatDiv = document.getElementById('chat-view');
   const apiDiv = document.getElementById('api-view');
+  const statsDiv = document.getElementById('stats-view');
+  const timelineDiv = document.getElementById('timeline-view');
+
+  chatDiv.style.display = 'none';
+  apiDiv.style.display = 'none';
+  if (statsDiv) statsDiv.style.display = 'none';
+  if (timelineDiv) timelineDiv.style.display = 'none';
 
   if (view === 'chat') {{
     chatDiv.style.display = '';
-    apiDiv.style.display = 'none';
-  }} else {{
-    chatDiv.style.display = 'none';
+  }} else if (view === 'api') {{
     apiDiv.style.display = '';
     if (!apiViewLoaded && currentFile) {{
       apiDiv.innerHTML = '<div class="loading">載入 API View...</div>';
@@ -1042,8 +1676,211 @@ async function switchView(view, btn) {{
       apiDiv.innerHTML = await res.text();
       apiViewLoaded = true;
     }}
+  }} else if (view === 'stats') {{
+    if (statsDiv) {{
+      statsDiv.style.display = '';
+      if (!apiStatsLoaded && currentFile) {{
+        statsDiv.innerHTML = '<div class="loading">載入 Stats...</div>';
+        const res = await fetch('/api/stats?file=' + encodeURIComponent(currentFile));
+        const data = await res.json();
+        statsDiv.innerHTML = renderStats(data);
+        apiStatsLoaded = true;
+      }}
+    }}
+  }} else if (view === 'timeline') {{
+    if (timelineDiv) {{
+      timelineDiv.style.display = '';
+      if (!apiTimelineLoaded && currentFile) {{
+        timelineDiv.innerHTML = '<div class="loading">載入 Timeline...</div>';
+        const res = await fetch('/api/timeline?file=' + encodeURIComponent(currentFile));
+        const data = await res.json();
+        timelineDiv.innerHTML = renderTimeline(data);
+        initTimelineDrag();
+        apiTimelineLoaded = true;
+      }}
+    }}
   }}
 }}
+
+// ─── Stats Rendering ───
+function fmtDuration(sec) {{
+  if (sec < 60) return sec + 's';
+  if (sec < 3600) return Math.floor(sec/60) + 'm ' + (sec%60) + 's';
+  return Math.floor(sec/3600) + 'h ' + Math.floor((sec%3600)/60) + 'm';
+}}
+
+function renderStats(data) {{
+  if (data.error) return '<div class="loading">Error: ' + escHtml(data.error) + '</div>';
+
+  const totalTokens = data.total_input + data.total_output + data.total_cache_read + data.total_cache_create;
+
+  // Stat cards
+  let html = '<div class="stats-cards">';
+  html += '<div class="stat-card cost"><div class="stat-value">$' + data.total_cost.toFixed(4) + '</div><div class="stat-label">Estimated Cost</div></div>';
+  html += '<div class="stat-card tokens"><div class="stat-value">' + totalTokens.toLocaleString() + '</div><div class="stat-label">Total Tokens</div></div>';
+  html += '<div class="stat-card"><div class="stat-value">' + data.api_call_count + '</div><div class="stat-label">API Calls</div></div>';
+  html += '<div class="stat-card duration"><div class="stat-value">' + fmtDuration(data.duration_sec) + '</div><div class="stat-label">Duration</div></div>';
+  html += '</div>';
+
+  // Message counts info
+  html += '<div style="color:#8b949e;font-size:0.82em;margin-bottom:16px">Messages: ' + data.user_msg_count + ' user, ' + data.assistant_msg_count + ' assistant, ' + data.tool_msg_count + ' tool results</div>';
+
+  html += '<div class="stats-charts">';
+
+  // Tool usage bar chart
+  const tools = Object.entries(data.tool_usage).sort((a,b) => b[1] - a[1]);
+  if (tools.length > 0) {{
+    const maxCount = tools[0][1];
+    const barH = 24;
+    const gap = 6;
+    const svgH = tools.length * (barH + gap) + 10;
+    const labelW = 100;
+    const chartW = 500;
+    let svg = '<svg viewBox="0 0 ' + (labelW + chartW + 60) + ' ' + svgH + '" xmlns="http://www.w3.org/2000/svg">';
+    const colors = ['#58a6ff','#3fb950','#d29922','#a371f7','#f85149','#79c0ff','#7ee787','#e3b341','#d2a8ff','#ff7b72'];
+    tools.forEach((t, i) => {{
+      const y = i * (barH + gap) + 5;
+      const w = maxCount > 0 ? (t[1] / maxCount) * chartW : 0;
+      const c = colors[i % colors.length];
+      svg += '<text x="' + (labelW - 4) + '" y="' + (y + barH/2 + 4) + '" fill="#8b949e" font-size="12" text-anchor="end" font-family="monospace">' + escHtml(t[0]) + '</text>';
+      svg += '<rect x="' + labelW + '" y="' + y + '" width="' + w + '" height="' + barH + '" rx="4" fill="' + c + '" opacity="0.7"/>';
+      svg += '<text x="' + (labelW + w + 6) + '" y="' + (y + barH/2 + 4) + '" fill="#c9d1d9" font-size="12" font-family="monospace">' + t[1] + '</text>';
+    }});
+    svg += '</svg>';
+    html += '<div class="stats-chart-box"><h3>Tool Usage Distribution</h3>' + svg + '</div>';
+  }}
+
+  // Token type donut chart
+  const tokenParts = [
+    {{label: 'Input', val: data.total_input, color: '#58a6ff'}},
+    {{label: 'Output', val: data.total_output, color: '#3fb950'}},
+    {{label: 'Cache Read', val: data.total_cache_read, color: '#d29922'}},
+    {{label: 'Cache Create', val: data.total_cache_create, color: '#a371f7'}},
+  ].filter(p => p.val > 0);
+  if (tokenParts.length > 0) {{
+    const total = tokenParts.reduce((s,p) => s + p.val, 0);
+    let donut = '<svg viewBox="0 0 300 220" xmlns="http://www.w3.org/2000/svg">';
+    const cx = 110, cy = 110, r = 80, ir = 50;
+    let angle = -Math.PI / 2;
+    tokenParts.forEach(p => {{
+      const frac = p.val / total;
+      const a1 = angle;
+      const a2 = angle + frac * 2 * Math.PI;
+      const large = frac > 0.5 ? 1 : 0;
+      const x1o = cx + r * Math.cos(a1), y1o = cy + r * Math.sin(a1);
+      const x2o = cx + r * Math.cos(a2), y2o = cy + r * Math.sin(a2);
+      const x1i = cx + ir * Math.cos(a2), y1i = cy + ir * Math.sin(a2);
+      const x2i = cx + ir * Math.cos(a1), y2i = cy + ir * Math.sin(a1);
+      donut += '<path d="M' + x1o + ',' + y1o + ' A' + r + ',' + r + ' 0 ' + large + ' 1 ' + x2o + ',' + y2o + ' L' + x1i + ',' + y1i + ' A' + ir + ',' + ir + ' 0 ' + large + ' 0 ' + x2i + ',' + y2i + ' Z" fill="' + p.color + '" opacity="0.8"/>';
+      angle = a2;
+    }});
+    // Legend
+    tokenParts.forEach((p, i) => {{
+      const ly = 20 + i * 22;
+      donut += '<rect x="220" y="' + ly + '" width="12" height="12" rx="2" fill="' + p.color + '" opacity="0.8"/>';
+      donut += '<text x="238" y="' + (ly + 10) + '" fill="#8b949e" font-size="11" font-family="sans-serif">' + p.label + ': ' + p.val.toLocaleString() + '</text>';
+    }});
+    // Center text
+    donut += '<text x="' + cx + '" y="' + (cy - 4) + '" fill="#c9d1d9" font-size="14" text-anchor="middle" font-weight="700">' + totalTokens.toLocaleString() + '</text>';
+    donut += '<text x="' + cx + '" y="' + (cy + 14) + '" fill="#8b949e" font-size="10" text-anchor="middle">total</text>';
+    donut += '</svg>';
+    html += '<div class="stats-chart-box"><h3>Token Type Breakdown</h3>' + donut + '</div>';
+  }}
+
+  html += '</div>';
+
+  // Cumulative cost line chart
+  if (data.per_call_cost.length > 1) {{
+    let cumCost = [];
+    let running = 0;
+    data.per_call_cost.forEach(c => {{ running += c; cumCost.push(running); }});
+    const maxCost = cumCost[cumCost.length - 1] || 1;
+    const chartW = 700, chartH = 200, padL = 60, padR = 20, padT = 10, padB = 30;
+    const plotW = chartW - padL - padR, plotH = chartH - padT - padB;
+    let points = cumCost.map((c, i) => {{
+      const x = padL + (i / (cumCost.length - 1)) * plotW;
+      const y = padT + plotH - (c / maxCost) * plotH;
+      return x + ',' + y;
+    }});
+    let lineChart = '<svg viewBox="0 0 ' + chartW + ' ' + chartH + '" xmlns="http://www.w3.org/2000/svg">';
+    // Grid lines
+    for (let i = 0; i <= 4; i++) {{
+      const y = padT + (i/4) * plotH;
+      const val = ((4-i)/4 * maxCost).toFixed(4);
+      lineChart += '<line x1="' + padL + '" y1="' + y + '" x2="' + (chartW - padR) + '" y2="' + y + '" stroke="#21262d" stroke-width="1"/>';
+      lineChart += '<text x="' + (padL - 6) + '" y="' + (y + 4) + '" fill="#484f58" font-size="9" text-anchor="end" font-family="monospace">$' + val + '</text>';
+    }}
+    // X axis labels
+    lineChart += '<text x="' + padL + '" y="' + (chartH - 4) + '" fill="#484f58" font-size="9" text-anchor="start">1</text>';
+    lineChart += '<text x="' + (chartW - padR) + '" y="' + (chartH - 4) + '" fill="#484f58" font-size="9" text-anchor="end">' + cumCost.length + '</text>';
+    lineChart += '<text x="' + (padL + plotW/2) + '" y="' + (chartH - 4) + '" fill="#484f58" font-size="9" text-anchor="middle">API Calls</text>';
+    // Area fill
+    lineChart += '<polygon points="' + padL + ',' + (padT + plotH) + ' ' + points.join(' ') + ' ' + (chartW - padR) + ',' + (padT + plotH) + '" fill="#58a6ff" opacity="0.1"/>';
+    // Line
+    lineChart += '<polyline points="' + points.join(' ') + '" fill="none" stroke="#58a6ff" stroke-width="2"/>';
+    // End dot
+    if (points.length > 0) {{
+      const last = points[points.length - 1].split(',');
+      lineChart += '<circle cx="' + last[0] + '" cy="' + last[1] + '" r="3" fill="#58a6ff"/>';
+    }}
+    lineChart += '</svg>';
+    html += '<div class="stats-chart-box full-width" style="margin-top:0"><h3>Cumulative Cost Over API Calls</h3>' + lineChart + '</div>';
+  }}
+
+  return html;
+}}
+
+// ─── Secrets Detection ───
+async function checkSecrets() {{
+  if (!currentFile) return;
+  try {{
+    const res = await fetch('/api/secrets?file=' + encodeURIComponent(currentFile));
+    const secrets = await res.json();
+    const banner = document.getElementById('secret-banner');
+    const badgeArea = document.getElementById('secret-badge-area');
+    if (!banner || !badgeArea) return;
+    if (secrets.length > 0) {{
+      banner.classList.add('visible');
+      let inner = '<strong>&#x26A0; ' + secrets.length + ' potential secret(s) detected!</strong>';
+      inner += '<div class="secret-list">';
+      secrets.forEach(s => {{
+        inner += '<div><span class="secret-type">' + escHtml(s.type) + '</span> <span class="secret-masked">' + escHtml(s.masked) + '</span> <span style="color:#484f58">(line ' + s.line + ')</span></div>';
+      }});
+      inner += '</div>';
+      banner.innerHTML = inner;
+      badgeArea.innerHTML = '<span class="secret-badge">' + secrets.length + ' secret' + (secrets.length > 1 ? 's' : '') + '</span>';
+    }} else {{
+      banner.classList.remove('visible');
+      banner.innerHTML = '';
+      badgeArea.innerHTML = '';
+    }}
+  }} catch(e) {{
+    // ignore
+  }}
+}}
+
+// ─── Export ───
+function toggleExportMenu() {{
+  const menu = document.getElementById('export-menu');
+  if (menu) menu.classList.toggle('open');
+}}
+
+function doExport(fmt) {{
+  if (!currentFile) return;
+  const url = '/api/export?file=' + encodeURIComponent(currentFile) + '&fmt=' + fmt;
+  window.open(url, '_blank');
+  const menu = document.getElementById('export-menu');
+  if (menu) menu.classList.remove('open');
+}}
+
+// Close export menu on outside click
+document.addEventListener('click', e => {{
+  const dd = document.querySelector('.export-dropdown');
+  const menu = document.getElementById('export-menu');
+  if (menu && dd && !dd.contains(e.target)) {{
+    menu.classList.remove('open');
+  }}
+}});
 
 // ─── Navigation ───
 let sessionLoaded = false;
@@ -1209,9 +2046,482 @@ loadSession = async function(filepath, el) {{
   await _origLoadSession(filepath, el);
   sessionLoaded = true;
   apiViewLoaded = false;
+  apiStatsLoaded = false;
+  apiTimelineLoaded = false;
   setTimeout(buildMinimap, 100);
   updateScrollUI();
 }};
+
+// ─── Global Search ───
+function handleSearchKey(e) {{
+  const input = e.target;
+  const val = input.value.trim();
+  if (e.key === 'Enter' && val.length > 0) {{
+    e.preventDefault();
+    const query = val.startsWith('/') ? val.slice(1).trim() : val;
+    if (query.length > 0) {{
+      doGlobalSearch(query);
+    }}
+    return;
+  }}
+  // Normal folder filtering on other keys
+}}
+
+async function doGlobalSearch(query) {{
+  const viewer = document.getElementById('viewer');
+  viewer.innerHTML = '<div class="loading">搜尋中...</div>';
+  sessionLoaded = false;
+
+  try {{
+    const res = await fetch('/api/search?q=' + encodeURIComponent(query));
+    const results = await res.json();
+
+    if (results.error) {{
+      viewer.innerHTML = '<div class="loading">Error: ' + escHtml(results.error) + '</div>';
+      return;
+    }}
+
+    let html = '<div class="search-results">';
+    html += '<h2>Search: "' + escHtml(query) + '"</h2>';
+    html += '<div class="sr-meta">' + results.length + ' result' + (results.length !== 1 ? 's' : '') + (results.length >= 50 ? ' (limit reached)' : '') + '</div>';
+
+    if (results.length === 0) {{
+      html += '<div style="color:#484f58;text-align:center;margin-top:40px">No results found.</div>';
+    }} else {{
+      results.forEach(r => {{
+        const typeClass = r.record_type === 'user' ? 'sr-type-user' : 'sr-type-assistant';
+        const preview = escHtml(r.preview).replace(
+          new RegExp('(' + escRegex(escHtml(r.match_text)) + ')', 'gi'),
+          '<mark>$1</mark>'
+        );
+        html += '<div class="search-result" onclick="loadSearchResult(\'' + escAttr(r.path) + '\')">';
+        html += '<div class="sr-header">';
+        html += '<span class="sr-type ' + typeClass + '">' + escHtml(r.record_type) + '</span>';
+        html += '<span class="sr-folder">' + escHtml(r.folder.replace(/-/g, '/')) + '</span>';
+        html += '<span class="sr-time">' + escHtml(r.timestamp) + '</span>';
+        html += '</div>';
+        html += '<div class="sr-preview">' + preview + '</div>';
+        html += '<div class="sr-session">' + escHtml(r.session_id) + '</div>';
+        html += '</div>';
+      }});
+    }}
+    html += '</div>';
+    viewer.innerHTML = html;
+  }} catch(err) {{
+    viewer.innerHTML = '<div class="loading">Search error: ' + escHtml(err.message) + '</div>';
+  }}
+}}
+
+function escRegex(s) {{
+  return s.replace(/[.*+?^${{}}()|[\\]\\\\]/g, '\\\\$&');
+}}
+
+function escAttr(s) {{
+  return s.replace(/\\\\/g, '\\\\\\\\').replace(/'/g, "\\\\'");
+}}
+
+function loadSearchResult(path) {{
+  // Find the session item in sidebar if visible, otherwise just load directly
+  const items = document.querySelectorAll('.session-item');
+  let found = null;
+  items.forEach(item => {{
+    if (item.dataset.path === path) found = item;
+  }});
+  loadSession(path, found);
+}}
+
+// ─── Live Watch ───
+let watchActive = false;
+let watchTimer = null;
+let lastPollTime = Date.now() / 1000;
+let knownMtimes = {{}};
+
+function toggleWatch() {{
+  watchActive = !watchActive;
+  const btn = document.getElementById('watch-toggle');
+  btn.classList.toggle('active', watchActive);
+  if (watchActive) {{
+    lastPollTime = Date.now() / 1000;
+    pollNow();
+    watchTimer = setInterval(pollNow, 5000);
+  }} else {{
+    if (watchTimer) clearInterval(watchTimer);
+    watchTimer = null;
+    // Clear all badges
+    document.querySelectorAll('.session-badge').forEach(b => b.remove());
+    const banner = document.getElementById('reload-banner');
+    if (banner) banner.style.display = 'none';
+  }}
+}}
+
+async function pollNow() {{
+  if (!watchActive) return;
+  try {{
+    const res = await fetch('/api/poll?since=' + lastPollTime);
+    const changed = await res.json();
+    if (changed.error || !Array.isArray(changed) || changed.length === 0) return;
+
+    changed.forEach(c => {{
+      const key = c.folder + '/' + c.filename;
+      const isNew = !knownMtimes[key];
+      knownMtimes[key] = c.mtime;
+
+      // Add badge to session item if visible
+      const items = document.querySelectorAll('.session-item');
+      items.forEach(item => {{
+        if (item.dataset.path === c.path) {{
+          // Remove existing badge first
+          const old = item.querySelector('.session-badge');
+          if (old) old.remove();
+          const badge = document.createElement('span');
+          badge.className = 'session-badge ' + (isNew ? 'session-badge-new' : 'session-badge-upd');
+          badge.textContent = isNew ? 'NEW' : 'UPD';
+          const preview = item.querySelector('.session-preview');
+          if (preview) preview.appendChild(badge);
+        }}
+      }});
+
+      // If currently viewed session was modified, show reload banner
+      if (currentFile === c.path) {{
+        const banner = document.getElementById('reload-banner');
+        if (banner) banner.style.display = 'block';
+      }}
+    }});
+
+    lastPollTime = Date.now() / 1000;
+  }} catch(e) {{
+    // ignore poll errors
+  }}
+}}
+
+function reloadCurrentSession() {{
+  const banner = document.getElementById('reload-banner');
+  if (banner) banner.style.display = 'none';
+  if (currentFile) {{
+    const active = document.querySelector('.session-item.active');
+    loadSession(currentFile, active);
+  }}
+}}
+
+// ─── Keyboard shortcut: / to focus search ───
+const _origKeyHandler = document.onkeydown;
+document.addEventListener('keydown', e => {{
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+  if (e.key === '/') {{
+    e.preventDefault();
+    const input = document.getElementById('folder-search');
+    if (input) {{
+      input.focus();
+      input.select();
+    }}
+  }}
+}});
+
+// Initialize known mtimes on load
+async function initKnownMtimes() {{
+  try {{
+    const res = await fetch('/api/poll?since=0');
+    const all = await res.json();
+    if (Array.isArray(all)) {{
+      all.forEach(c => {{
+        knownMtimes[c.folder + '/' + c.filename] = c.mtime;
+      }});
+    }}
+  }} catch(e) {{}}
+}}
+initKnownMtimes();
+
+// ─── Timeline View ───
+let tlScale = 1.0; // pixels per second
+
+function renderTimeline(data) {{
+  if (data.error) return '<div class="loading">Error: ' + escHtml(data.error) + '</div>';
+  if (!data.length) return '<div class="loading">No timeline entries</div>';
+
+  // Parse timestamps
+  const entries = data.map(e => ({{
+    ...e,
+    dt: new Date(e.ts.replace('Z', '+00:00')),
+  }}));
+  const t0 = entries[0].dt.getTime();
+  const tN = entries[entries.length - 1].dt.getTime();
+  const durationSec = Math.max((tN - t0) / 1000, 1);
+
+  // Default scale: try to fit ~1200px for the whole session, min 0.5 px/sec
+  tlScale = Math.max(1200 / durationSec, 0.5);
+
+  let html = '<div class="timeline-controls">';
+  html += '<button onclick="tlZoom(1.5)">+ Zoom In</button>';
+  html += '<button onclick="tlZoom(0.67)">- Zoom Out</button>';
+  html += '<button onclick="tlFit()">Fit</button>';
+  html += '<span style="color:#484f58;font-size:0.78em;margin-left:10px" id="tl-info">' + entries.length + ' events, ' + fmtDuration(Math.round(durationSec)) + '</span>';
+  html += '<div class="tl-legend"><span class="lg-user">user</span><span class="lg-assistant">assistant</span><span class="lg-tool">tool</span><span class="lg-thinking">thinking</span><span class="lg-system">system</span></div>';
+  html += '</div>';
+
+  html += '<div class="timeline-container" id="tl-container" data-t0="' + t0 + '" data-tn="' + tN + '" data-duration="' + durationSec + '">';
+  html += '<div class="timeline-inner" id="tl-inner">';
+  html += '<div class="timeline-cursor" id="tl-cursor" style="display:none"><div class="timeline-cursor-label" id="tl-cursor-label"></div></div>';
+  html += '</div>';
+  html += '<div class="timeline-axis" id="tl-axis"></div>';
+  html += '</div>';
+
+  // We build cards and axis ticks via JS after render for dynamic sizing
+  setTimeout(() => buildTimelineCards(entries), 0);
+  return html;
+}}
+
+function buildTimelineCards(entries) {{
+  const container = document.getElementById('tl-container');
+  const inner = document.getElementById('tl-inner');
+  const axis = document.getElementById('tl-axis');
+  if (!container || !inner || !axis) return;
+
+  const t0 = parseFloat(container.dataset.t0);
+  const tN = parseFloat(container.dataset.tn);
+  const durationSec = parseFloat(container.dataset.duration);
+  const totalW = Math.max(durationSec * tlScale + 100, container.clientWidth);
+  inner.style.width = totalW + 'px';
+  axis.style.width = totalW + 'px';
+
+  // Clear old cards
+  inner.querySelectorAll('.timeline-card').forEach(c => c.remove());
+  axis.querySelectorAll('.timeline-tick').forEach(t => t.remove());
+
+  // Collision tracking: columns of occupied y-positions
+  const CARD_H = 32;
+  const CARD_W = 80;
+  const GAP = 4;
+  const columns = []; // array of {{x, y, xEnd}}
+
+  const typeClass = {{ user: 'tc-user', assistant: 'tc-assistant', tool: 'tc-tool', thinking: 'tc-thinking', system: 'tc-system', progress: 'tc-progress' }};
+
+  entries.forEach(e => {{
+    const dt = new Date(e.ts.replace('Z', '+00:00'));
+    const sec = (dt.getTime() - t0) / 1000;
+    const x = Math.round(sec * tlScale + 20);
+
+    // Find vertical slot (stack if overlap)
+    let row = 0;
+    for (let r = 0; r < 50; r++) {{
+      let overlap = false;
+      for (const col of columns) {{
+        if (x < col.xEnd && (x + CARD_W) > col.x && col.row === r) {{
+          overlap = true;
+          break;
+        }}
+      }}
+      if (!overlap) {{ row = r; break; }}
+    }}
+    columns.push({{ x, xEnd: x + CARD_W + GAP, row }});
+
+    const y = 10 + row * (CARD_H + GAP);
+    const cls = typeClass[e.type] || 'tc-progress';
+    const card = document.createElement('div');
+    card.className = 'timeline-card ' + cls;
+    card.style.left = x + 'px';
+    card.style.top = y + 'px';
+    card.dataset.entryId = e.id;
+    card.title = e.summary + '\\n' + dt.toLocaleTimeString();
+    card.textContent = e.summary || e.type;
+    card.onclick = () => {{
+      // Switch to chat view and scroll to that entry
+      const chatBtn = document.querySelector('.view-toggle button:first-child');
+      if (chatBtn) switchView('chat', chatBtn);
+      setTimeout(() => {{
+        const target = document.getElementById('e' + e.id);
+        if (target) blinkTarget(target);
+      }}, 200);
+    }};
+    inner.appendChild(card);
+  }});
+
+  // Adjust inner height
+  const maxRow = columns.reduce((m, c) => Math.max(m, c.row), 0);
+  inner.style.minHeight = (10 + (maxRow + 1) * (CARD_H + GAP) + 40) + 'px';
+
+  // Build axis ticks
+  const tickInterval = getTickInterval(durationSec);
+  const startDate = new Date(t0);
+  // Round to next tick
+  const startSec = Math.ceil((startDate.getTime() / 1000) / tickInterval) * tickInterval;
+  for (let ts = startSec; ts <= tN / 1000; ts += tickInterval) {{
+    const sec = ts - t0 / 1000;
+    const x = Math.round(sec * tlScale + 20);
+    const dt = new Date(ts * 1000);
+    const tick = document.createElement('div');
+    tick.className = 'timeline-tick';
+    tick.style.left = x + 'px';
+    tick.textContent = dt.toLocaleTimeString([], {{ hour: '2-digit', minute: '2-digit' }});
+    axis.appendChild(tick);
+  }}
+
+  // Mouse cursor line
+  container.onmousemove = (ev) => {{
+    const rect = container.getBoundingClientRect();
+    const scrollLeft = container.scrollLeft;
+    const mx = ev.clientX - rect.left + scrollLeft;
+    const cursor = document.getElementById('tl-cursor');
+    const label = document.getElementById('tl-cursor-label');
+    if (cursor) {{
+      cursor.style.display = '';
+      cursor.style.left = mx + 'px';
+    }}
+    if (label) {{
+      const sec = (mx - 20) / tlScale;
+      const dt = new Date(t0 + sec * 1000);
+      label.textContent = dt.toLocaleTimeString([], {{ hour: '2-digit', minute: '2-digit', second: '2-digit' }});
+    }}
+  }};
+  container.onmouseleave = () => {{
+    const cursor = document.getElementById('tl-cursor');
+    if (cursor) cursor.style.display = 'none';
+  }};
+}}
+
+function getTickInterval(durationSec) {{
+  // Choose a nice tick interval in seconds
+  if (durationSec < 60) return 10;
+  if (durationSec < 300) return 30;
+  if (durationSec < 600) return 60;
+  if (durationSec < 1800) return 300;
+  if (durationSec < 7200) return 600;
+  if (durationSec < 14400) return 1800;
+  return 3600;
+}}
+
+let _tlEntries = null;
+function tlZoom(factor) {{
+  tlScale *= factor;
+  tlScale = Math.max(0.05, Math.min(tlScale, 50));
+  // Re-render with cached data
+  const container = document.getElementById('tl-container');
+  if (!container) return;
+  const timelineDiv = document.getElementById('timeline-view');
+  if (timelineDiv && currentFile) {{
+    // Re-fetch and rebuild
+    fetch('/api/timeline?file=' + encodeURIComponent(currentFile))
+      .then(r => r.json())
+      .then(data => {{
+        const entries = data.map(e => ({{ ...e, dt: new Date(e.ts.replace('Z', '+00:00')) }}));
+        buildTimelineCards(entries);
+      }});
+  }}
+}}
+
+function tlFit() {{
+  const container = document.getElementById('tl-container');
+  if (!container) return;
+  const durationSec = parseFloat(container.dataset.duration);
+  tlScale = Math.max((container.clientWidth - 60) / durationSec, 0.05);
+  tlZoom(1); // rebuild
+}}
+
+function initTimelineDrag() {{
+  const container = document.getElementById('tl-container');
+  if (!container) return;
+  let isDragging = false;
+  let startX = 0;
+  let scrollStart = 0;
+
+  container.addEventListener('mousedown', (e) => {{
+    if (e.target.classList.contains('timeline-card')) return;
+    isDragging = true;
+    startX = e.clientX;
+    scrollStart = container.scrollLeft;
+    container.classList.add('dragging');
+    e.preventDefault();
+  }});
+  document.addEventListener('mousemove', (e) => {{
+    if (!isDragging) return;
+    container.scrollLeft = scrollStart - (e.clientX - startX);
+  }});
+  document.addEventListener('mouseup', () => {{
+    isDragging = false;
+    container.classList.remove('dragging');
+  }});
+}}
+
+// ─── JSONL Upload / Drag & Drop ───
+function setupDropZone() {{
+  // Welcome page drop zone
+  const welcomeZone = document.getElementById('welcome-drop-zone');
+  if (welcomeZone) {{
+    welcomeZone.addEventListener('dragover', (e) => {{
+      e.preventDefault();
+      welcomeZone.classList.add('drag-over');
+    }});
+    welcomeZone.addEventListener('dragleave', () => {{
+      welcomeZone.classList.remove('drag-over');
+    }});
+    welcomeZone.addEventListener('drop', (e) => {{
+      e.preventDefault();
+      welcomeZone.classList.remove('drag-over');
+      handleFileDrop(e.dataTransfer.files);
+    }});
+  }}
+
+  // Global overlay for sidebar / anywhere
+  const overlay = document.getElementById('drop-overlay');
+  let dragCount = 0;
+
+  document.addEventListener('dragenter', (e) => {{
+    e.preventDefault();
+    dragCount++;
+    if (overlay) overlay.classList.add('visible');
+  }});
+  document.addEventListener('dragleave', (e) => {{
+    e.preventDefault();
+    dragCount--;
+    if (dragCount <= 0) {{
+      dragCount = 0;
+      if (overlay) overlay.classList.remove('visible');
+    }}
+  }});
+  document.addEventListener('dragover', (e) => {{
+    e.preventDefault();
+  }});
+  document.addEventListener('drop', (e) => {{
+    e.preventDefault();
+    dragCount = 0;
+    if (overlay) overlay.classList.remove('visible');
+    // Only handle if dropped on overlay or welcome zone (not on other interactive elements)
+    if (e.target === overlay || overlay.contains(e.target) ||
+        e.target.closest('.sidebar') || e.target.closest('.drop-zone')) {{
+      handleFileDrop(e.dataTransfer.files);
+    }}
+  }});
+}}
+
+async function handleFileDrop(files) {{
+  if (!files || files.length === 0) return;
+  const file = files[0];
+  if (!file.name.endsWith('.jsonl')) {{
+    alert('Please drop a .jsonl file');
+    return;
+  }}
+
+  const viewer = document.getElementById('viewer');
+  if (viewer) viewer.innerHTML = '<div class="loading">Uploading...</div>';
+
+  try {{
+    const text = await file.text();
+    const res = await fetch('/api/upload', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'text/plain' }},
+      body: text,
+    }});
+    const data = await res.json();
+    if (data.ok) {{
+      loadSession(data.path, null);
+    }} else {{
+      if (viewer) viewer.innerHTML = '<div class="loading">Upload error: ' + escHtml(data.error || 'unknown') + '</div>';
+    }}
+  }} catch (err) {{
+    if (viewer) viewer.innerHTML = '<div class="loading">Upload error: ' + escHtml(err.message) + '</div>';
+  }}
+}}
+
+setTimeout(setupDropZone, 100);
 
 loadFolders();
 </script>
